@@ -17,7 +17,7 @@ const SHELLY_DEVICE_IDS = [
 const START_W = 5;
 const STOP_W = 3;
 
-const INTERVAL_MS = 5000; // ⏱ 5 secondes
+const INTERVAL_MS = 3000; // ⏱ 5 secondes
 const FETCH_TIMEOUT_MS = 15000;
 const PORT = 8080;
 
