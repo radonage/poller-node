@@ -3,7 +3,7 @@ import http from "http";
 const POLL_URL =
   "https://massage-cyan-delta.vercel.app/api/poll?secret=123456";
 
-const INTERVAL_MS = 3000;
+const INTERVAL_MS = 10000;
 const PORT = process.env.PORT || 8080;
 
 function sleep(ms) {
