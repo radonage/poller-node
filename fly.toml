@@ -1,10 +1,10 @@
-# fly.toml app configuration file generated for poller-node-kk2tsg on 2026-03-08T20:19:06Z
+# fly.toml app configuration file generated for poller-node-plrz1g on 2026-03-08T20:26:59Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'poller-node-kk2tsg'
-primary_region = 'ams'
+app = 'poller-node-plrz1g'
+primary_region = 'cdg'
 
 [build]
 
