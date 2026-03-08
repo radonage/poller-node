@@ -12,16 +12,20 @@ function sleep(ms) {
 
 async function tick() {
   console.log("--------------------------------------------------");
-  console.log("Envoi requête :", new Date().toLocaleString());
+  console.log("⏱ Envoi requête :", new Date().toLocaleString());
 
-  const res = await fetch(POLL_URL);
-  const text = await res.text();
+  try {
+    const res = await fetch(POLL_URL);
+    const text = await res.text();
 
-  console.log("Status HTTP :", res.status);
-  console.log("Réponse brute :", text);
+    console.log("Status HTTP :", res.status);
+    console.log("Réponse brute :", text);
 
-  if (!res.ok) {
-    throw new Error(`HTTP error ${res.status}`);
+    if (!res.ok) {
+      throw new Error(`HTTP error ${res.status}`);
+    }
+  } catch (err) {
+    console.error("Erreur tick :", err.message);
   }
 }
 
@@ -29,12 +33,7 @@ async function main() {
   console.log("Poller démarré...");
 
   while (true) {
-    try {
-      await tick();
-    } catch (e) {
-      console.error("Erreur :", e.message);
-    }
-
+    await tick();
     await sleep(INTERVAL_MS);
   }
 }
@@ -53,7 +52,7 @@ http
     res.end("Poller running");
   })
   .listen(PORT, "0.0.0.0", () => {
-    console.log(`Health server listening on 0.0.0.0:${PORT}`);
+    console.log(`HTTP server listening on 0.0.0.0:${PORT}`);
   });
 
 main();
