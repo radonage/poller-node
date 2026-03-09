@@ -6,16 +6,6 @@ const SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3Mi
 const SERVER_URI = "https://shelly-165-eu.shelly.cloud";
 const AUTH_KEY = "MmVkMWVidWlk2CAB39DBD5697035A61BC935AA12DF1D78A1196C36B19FB1B6AA4B8FB72062AB450CE001DBB77341";
 
- 
-
- 
-const PORT = 8080;
-const INTERVAL_MS = 3000;
-const FETCH_TIMEOUT_MS = 2500;
-
-const START_W = 5;
-const STOP_W = 2;
-
 const SHELLY_DEVICE_IDS = [
   "f1b457",
   "f1b3d3",
@@ -23,6 +13,15 @@ const SHELLY_DEVICE_IDS = [
   "7c87ceb512a6",
   "7c87ceb4811e",
 ];
+
+const START_W = 5;
+const STOP_W = 3;
+
+const INTERVAL_MS = 3000; 
+const FETCH_TIMEOUT_MS = 15000;
+const PORT = 8080;
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const TAG_TO_DBID = {
   f1b457: "F1",
@@ -32,11 +31,9 @@ const TAG_TO_DBID = {
   "7c87ceb4811e": "F5",
 };
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+let running = false;
+let pollCount = 0;
 
-// =========================
-// UTILS
-// =========================
 function nowMs() {
   return Date.now();
 }
@@ -56,16 +53,8 @@ async function fetchDeviceStatus(tag) {
       }),
     });
 
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
-    }
-
-    return await res.json();
-  } catch (err) {
-    if (err.name === "AbortError") {
-      throw new Error(`Timeout après ${FETCH_TIMEOUT_MS} ms`);
-    }
-    throw err;
+    const data = await res.json();
+    return data;
   } finally {
     clearTimeout(timeout);
   }
@@ -86,17 +75,12 @@ function extractPower(data) {
   return null;
 }
 
-// =========================
-// SUPABASE HELPERS
-// =========================
 async function getState(device_id) {
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from("device_state")
     .select("*")
     .eq("device_id", device_id)
     .maybeSingle();
-
-  if (error) throw error;
 
   return (
     data || {
@@ -108,7 +92,7 @@ async function getState(device_id) {
 }
 
 async function saveState(st) {
-  const { error } = await supabase.from("device_state").upsert(
+  await supabase.from("device_state").upsert(
     {
       device_id: st.device_id,
       active: st.active,
@@ -117,62 +101,40 @@ async function saveState(st) {
     },
     { onConflict: "device_id" }
   );
-
-  if (error) throw error;
 }
 
 async function insertSessionStart(device_id, start_ms, start_w) {
-  const { error } = await supabase.from("sessions").insert({
+  await supabase.from("sessions").insert({
     device_id,
     start_ms,
     start_w,
   });
-
-  if (error) throw error;
 }
 
 async function updateSessionStop(device_id, start_ms, end_ms, end_w) {
   const duration_sec = Math.round((end_ms - start_ms) / 1000);
 
-  const { error } = await supabase
+  await supabase
     .from("sessions")
-    .update({
-      end_ms,
-      end_w,
-      duration_sec,
-    })
+    .update({ end_ms, end_w, duration_sec })
     .eq("device_id", device_id)
     .eq("start_ms", start_ms)
     .is("end_ms", null);
-
-  if (error) throw error;
 }
 
-// =========================
-// BUSINESS LOGIC
-// =========================
 async function pollOne(tag) {
   const ts = nowMs();
   const device_id = TAG_TO_DBID[tag] || tag;
 
   const status = await fetchDeviceStatus(tag);
   const power = extractPower(status);
-  const st = await getState(device_id);
 
-  if (power == null) {
-    await saveState(st);
-    return {
-      ok: false,
-      device_id,
-      power: null,
-      active: st.active,
-      reason: "power introuvable",
-    };
-  }
+  const st = await getState(device_id);
 
   if (!st.active && power > START_W) {
     st.active = true;
     st.open_start_ms = ts;
+
     await insertSessionStart(device_id, ts, power);
   } else if (st.active && power < STOP_W) {
     const start = st.open_start_ms;
@@ -187,81 +149,45 @@ async function pollOne(tag) {
 
   await saveState(st);
 
-  return {
-    ok: true,
-    device_id,
-    power,
-    active: st.active,
-  };
+  return { device_id, power, active: st.active };
 }
-
-let pollCount = 0;
 
 async function tick() {
+  if (running) return;
+
+  running = true;
   pollCount++;
-  const currentPoll = pollCount;
-  const startedAt = Date.now();
 
   console.log("--------------------------------------------------");
-  console.log(`[POLL ${currentPoll}] départ : ${new Date().toISOString()}`);
+  console.log(`[POLL ${pollCount}] ${new Date().toISOString()}`);
 
   try {
-    const results = await Promise.allSettled(
-      SHELLY_DEVICE_IDS.map((tag) => pollOne(tag))
-    );
-
-    for (let i = 0; i < results.length; i++) {
-      const tag = SHELLY_DEVICE_IDS[i];
-      const result = results[i];
-
-      if (result.status === "fulfilled") {
-        console.log(`[POLL ${currentPoll}] [OK ${tag}]`, result.value);
-      } else {
-        console.error(
-          `[POLL ${currentPoll}] [ERR ${tag}]`,
-          result.reason?.message || result.reason
-        );
-      }
+    for (const tag of SHELLY_DEVICE_IDS) {
+      const r = await pollOne(tag);
+      console.log(r);
     }
-  } catch (err) {
-    console.error(`[POLL ${currentPoll}] erreur globale :`, err.message);
-  } finally {
-    const elapsed = Date.now() - startedAt;
-    console.log(`[POLL ${currentPoll}] fin : ${new Date().toISOString()}`);
-    console.log(`[POLL ${currentPoll}] temps total : ${elapsed} ms`);
-    console.log(
-      `[POLL ${currentPoll}] mémoire RSS : ${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB`
-    );
+  } catch (e) {
+    console.error("Erreur:", e.message);
   }
+
+  running = false;
 }
 
-// =========================
-// HTTP SERVER
-// =========================
+function main() {
+  console.log("Poller démarré");
+  console.log("Interval :", INTERVAL_MS, "ms");
+
+  tick();
+  setInterval(tick, INTERVAL_MS);
+}
+
 http
   .createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.writeHead(200);
     res.end("Poller running");
   })
   .listen(PORT, "0.0.0.0", () => {
-    console.log(`HTTP server listening on 0.0.0.0:${PORT}`);
+    console.log("Server HTTP :", PORT);
   });
 
-// =========================
-// START
-// =========================
-console.log("Poller démarré");
-console.log("Interval :", INTERVAL_MS, "ms");
-console.log("Fetch timeout :", FETCH_TIMEOUT_MS, "ms");
-
-// premier tick immédiat
-tick().catch((err) => {
-  console.error("Erreur premier tick :", err.message);
-});
-
-// puis toutes les 3 secondes exactes
-setInterval(() => {
-  tick().catch((err) => {
-    console.error("Erreur interval tick :", err.message);
-  });
-}, INTERVAL_MS);
+main();
