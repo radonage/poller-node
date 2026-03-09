@@ -10,15 +10,11 @@ const AUTH_KEY = "MmVkMWVidWlk2CAB39DBD5697035A61BC935AA12DF1D78A1196C36B19FB1B6
 
  
 const PORT = 8080;
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
- 
- 
 const INTERVAL_MS = 3000;
 const FETCH_TIMEOUT_MS = 2500;
 
-const START_W = 5; // seuil démarrage session
-const STOP_W = 2;  // seuil arrêt session
+const START_W = 5;
+const STOP_W = 2;
 
 const SHELLY_DEVICE_IDS = [
   "f1b457",
@@ -43,10 +39,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // =========================
 function nowMs() {
   return Date.now();
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function fetchDeviceStatus(tag) {
@@ -165,10 +157,8 @@ async function pollOne(tag) {
 
   const status = await fetchDeviceStatus(tag);
   const power = extractPower(status);
-
   const st = await getState(device_id);
 
-  // si aucune puissance lisible, on garde juste l'état actuel
   if (power == null) {
     await saveState(st);
     return {
@@ -183,7 +173,6 @@ async function pollOne(tag) {
   if (!st.active && power > START_W) {
     st.active = true;
     st.open_start_ms = ts;
-
     await insertSessionStart(device_id, ts, power);
   } else if (st.active && power < STOP_W) {
     const start = st.open_start_ms;
@@ -210,46 +199,39 @@ let pollCount = 0;
 
 async function tick() {
   pollCount++;
+  const currentPoll = pollCount;
   const startedAt = Date.now();
 
   console.log("--------------------------------------------------");
-  console.log(`[POLL ${pollCount}] ${new Date().toISOString()}`);
+  console.log(`[POLL ${currentPoll}] départ : ${new Date().toISOString()}`);
 
-  const results = await Promise.allSettled(
-    SHELLY_DEVICE_IDS.map((tag) => pollOne(tag))
-  );
+  try {
+    const results = await Promise.allSettled(
+      SHELLY_DEVICE_IDS.map((tag) => pollOne(tag))
+    );
 
-  for (let i = 0; i < results.length; i++) {
-    const tag = SHELLY_DEVICE_IDS[i];
-    const result = results[i];
+    for (let i = 0; i < results.length; i++) {
+      const tag = SHELLY_DEVICE_IDS[i];
+      const result = results[i];
 
-    if (result.status === "fulfilled") {
-      console.log(`[OK ${tag}]`, result.value);
-    } else {
-      console.error(`[ERR ${tag}]`, result.reason?.message || result.reason);
+      if (result.status === "fulfilled") {
+        console.log(`[POLL ${currentPoll}] [OK ${tag}]`, result.value);
+      } else {
+        console.error(
+          `[POLL ${currentPoll}] [ERR ${tag}]`,
+          result.reason?.message || result.reason
+        );
+      }
     }
-  }
-
-  const elapsed = Date.now() - startedAt;
-  console.log(`Temps total du poll : ${elapsed} ms`);
-  console.log(
-    `Mémoire RSS : ${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB`
-  );
-}
-
-async function main() {
-  console.log("Poller démarré");
-  console.log("Interval :", INTERVAL_MS, "ms");
-  console.log("Fetch timeout :", FETCH_TIMEOUT_MS, "ms");
-
-  while (true) {
-    try {
-      await tick();
-    } catch (err) {
-      console.error("Erreur globale tick :", err.message);
-    }
-
-    await sleep(INTERVAL_MS);
+  } catch (err) {
+    console.error(`[POLL ${currentPoll}] erreur globale :`, err.message);
+  } finally {
+    const elapsed = Date.now() - startedAt;
+    console.log(`[POLL ${currentPoll}] fin : ${new Date().toISOString()}`);
+    console.log(`[POLL ${currentPoll}] temps total : ${elapsed} ms`);
+    console.log(
+      `[POLL ${currentPoll}] mémoire RSS : ${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB`
+    );
   }
 }
 
@@ -262,13 +244,24 @@ http
     res.end("Poller running");
   })
   .listen(PORT, "0.0.0.0", () => {
-    console.log("Server HTTP :", PORT);
+    console.log(`HTTP server listening on 0.0.0.0:${PORT}`);
   });
 
 // =========================
 // START
 // =========================
-main().catch((err) => {
-  console.error("Crash main :", err);
-  process.exit(1);
+console.log("Poller démarré");
+console.log("Interval :", INTERVAL_MS, "ms");
+console.log("Fetch timeout :", FETCH_TIMEOUT_MS, "ms");
+
+// premier tick immédiat
+tick().catch((err) => {
+  console.error("Erreur premier tick :", err.message);
 });
+
+// puis toutes les 3 secondes exactes
+setInterval(() => {
+  tick().catch((err) => {
+    console.error("Erreur interval tick :", err.message);
+  });
+}, INTERVAL_MS);
