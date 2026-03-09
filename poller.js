@@ -6,6 +6,20 @@ const SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3Mi
 const SERVER_URI = "https://shelly-165-eu.shelly.cloud";
 const AUTH_KEY = "MmVkMWVidWlk2CAB39DBD5697035A61BC935AA12DF1D78A1196C36B19FB1B6AA4B8FB72062AB450CE001DBB77341";
 
+ 
+
+ 
+const PORT = 8080;
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+ 
+ 
+const INTERVAL_MS = 3000;
+const FETCH_TIMEOUT_MS = 2500;
+
+const START_W = 5; // seuil démarrage session
+const STOP_W = 2;  // seuil arrêt session
+
 const SHELLY_DEVICE_IDS = [
   "f1b457",
   "f1b3d3",
@@ -13,15 +27,6 @@ const SHELLY_DEVICE_IDS = [
   "7c87ceb512a6",
   "7c87ceb4811e",
 ];
-
-const START_W = 5;
-const STOP_W = 3;
-
-const INTERVAL_MS = 1000; // ⏱ 5 secondes
-const FETCH_TIMEOUT_MS = 15000;
-const PORT = 8080;
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const TAG_TO_DBID = {
   f1b457: "F1",
@@ -31,11 +36,17 @@ const TAG_TO_DBID = {
   "7c87ceb4811e": "F5",
 };
 
-let running = false;
-let pollCount = 0;
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// =========================
+// UTILS
+// =========================
 function nowMs() {
   return Date.now();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function fetchDeviceStatus(tag) {
@@ -53,8 +64,16 @@ async function fetchDeviceStatus(tag) {
       }),
     });
 
-    const data = await res.json();
-    return data;
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    return await res.json();
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Timeout après ${FETCH_TIMEOUT_MS} ms`);
+    }
+    throw err;
   } finally {
     clearTimeout(timeout);
   }
@@ -75,12 +94,17 @@ function extractPower(data) {
   return null;
 }
 
+// =========================
+// SUPABASE HELPERS
+// =========================
 async function getState(device_id) {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("device_state")
     .select("*")
     .eq("device_id", device_id)
     .maybeSingle();
+
+  if (error) throw error;
 
   return (
     data || {
@@ -92,7 +116,7 @@ async function getState(device_id) {
 }
 
 async function saveState(st) {
-  await supabase.from("device_state").upsert(
+  const { error } = await supabase.from("device_state").upsert(
     {
       device_id: st.device_id,
       active: st.active,
@@ -101,27 +125,40 @@ async function saveState(st) {
     },
     { onConflict: "device_id" }
   );
+
+  if (error) throw error;
 }
 
 async function insertSessionStart(device_id, start_ms, start_w) {
-  await supabase.from("sessions").insert({
+  const { error } = await supabase.from("sessions").insert({
     device_id,
     start_ms,
     start_w,
   });
+
+  if (error) throw error;
 }
 
 async function updateSessionStop(device_id, start_ms, end_ms, end_w) {
   const duration_sec = Math.round((end_ms - start_ms) / 1000);
 
-  await supabase
+  const { error } = await supabase
     .from("sessions")
-    .update({ end_ms, end_w, duration_sec })
+    .update({
+      end_ms,
+      end_w,
+      duration_sec,
+    })
     .eq("device_id", device_id)
     .eq("start_ms", start_ms)
     .is("end_ms", null);
+
+  if (error) throw error;
 }
 
+// =========================
+// BUSINESS LOGIC
+// =========================
 async function pollOne(tag) {
   const ts = nowMs();
   const device_id = TAG_TO_DBID[tag] || tag;
@@ -130,6 +167,18 @@ async function pollOne(tag) {
   const power = extractPower(status);
 
   const st = await getState(device_id);
+
+  // si aucune puissance lisible, on garde juste l'état actuel
+  if (power == null) {
+    await saveState(st);
+    return {
+      ok: false,
+      device_id,
+      power: null,
+      active: st.active,
+      reason: "power introuvable",
+    };
+  }
 
   if (!st.active && power > START_W) {
     st.active = true;
@@ -149,45 +198,77 @@ async function pollOne(tag) {
 
   await saveState(st);
 
-  return { device_id, power, active: st.active };
+  return {
+    ok: true,
+    device_id,
+    power,
+    active: st.active,
+  };
 }
 
-async function tick() {
-  if (running) return;
+let pollCount = 0;
 
-  running = true;
+async function tick() {
   pollCount++;
+  const startedAt = Date.now();
 
   console.log("--------------------------------------------------");
   console.log(`[POLL ${pollCount}] ${new Date().toISOString()}`);
 
-  try {
-    for (const tag of SHELLY_DEVICE_IDS) {
-      const r = await pollOne(tag);
-      console.log(r);
+  const results = await Promise.allSettled(
+    SHELLY_DEVICE_IDS.map((tag) => pollOne(tag))
+  );
+
+  for (let i = 0; i < results.length; i++) {
+    const tag = SHELLY_DEVICE_IDS[i];
+    const result = results[i];
+
+    if (result.status === "fulfilled") {
+      console.log(`[OK ${tag}]`, result.value);
+    } else {
+      console.error(`[ERR ${tag}]`, result.reason?.message || result.reason);
     }
-  } catch (e) {
-    console.error("Erreur:", e.message);
   }
 
-  running = false;
+  const elapsed = Date.now() - startedAt;
+  console.log(`Temps total du poll : ${elapsed} ms`);
+  console.log(
+    `Mémoire RSS : ${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB`
+  );
 }
 
-function main() {
+async function main() {
   console.log("Poller démarré");
   console.log("Interval :", INTERVAL_MS, "ms");
+  console.log("Fetch timeout :", FETCH_TIMEOUT_MS, "ms");
 
-  tick();
-  setInterval(tick, INTERVAL_MS);
+  while (true) {
+    try {
+      await tick();
+    } catch (err) {
+      console.error("Erreur globale tick :", err.message);
+    }
+
+    await sleep(INTERVAL_MS);
+  }
 }
 
+// =========================
+// HTTP SERVER
+// =========================
 http
   .createServer((req, res) => {
-    res.writeHead(200);
+    res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("Poller running");
   })
   .listen(PORT, "0.0.0.0", () => {
     console.log("Server HTTP :", PORT);
   });
 
-main();
+// =========================
+// START
+// =========================
+main().catch((err) => {
+  console.error("Crash main :", err);
+  process.exit(1);
+});
