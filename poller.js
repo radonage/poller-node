@@ -4,8 +4,7 @@ const PORT = process.env.PORT || 8080;
 
 const SERVER_URI =
   process.env.SHELLY_SERVER_URI || "https://shelly-165-eu.shelly.cloud";
-const AUTH_KEY =
-  process.env.SHELLY_AUTH_KEY || "MmVkMWVidWlk2CAB39DBD5697035A61BC935AA12DF1D78A1196C36B19FB1B6AA4B8FB72062AB450CE001DBB77341";
+const AUTH_KEY = process.env.SHELLY_AUTH_KEY || "MmVkMWVidWlk2CAB39DBD5697035A61BC935AA12DF1D78A1196C36B19FB1B6AA4B8FB72062AB450CE001DBB77341";
 
 const SHELLY_DEVICE_IDS = [
   "f1b457",
@@ -23,18 +22,20 @@ const TAG_TO_DBID = {
   "7c87ceb4811e": "F5",
 };
 
-const START_W = 5;
-const STOP_W = 3;
+const START_W = Number(process.env.START_THRESHOLD ?? 5);
+const STOP_W = Number(process.env.STOP_THRESHOLD ?? 3);
 
-const INTERVAL_MS = 15000;
-const BETWEEN_DEVICES_MS = 2000;
+const INTERVAL_MS = Number(process.env.INTERVAL_MS ?? 15000);
+const BETWEEN_DEVICES_MS = Number(process.env.BETWEEN_DEVICES_MS ?? 2000);
 
-const ACTIVE_FROM = 8;
-const ACTIVE_TO = 24;
+const ACTIVE_FROM = Number(process.env.ACTIVE_FROM ?? 8);
+const ACTIVE_TO = Number(process.env.ACTIVE_TO ?? 24);
 
-const FETCH_TIMEOUT_MS = 15000;
-const MAX_RETRIES_429 = 1;
-const RETRY_429_MS = 5000;
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS ?? 15000);
+
+// ✅ même logique que Vercel
+const MAX_RETRIES_429 = Number(process.env.SHELLY_MAX_RETRIES_429 ?? 3);
+const BACKOFF_BASE_MS = Number(process.env.SHELLY_BACKOFF_BASE_MS ?? 800);
 
 const stateMap = {};
 let lastResponse = null;
@@ -52,6 +53,10 @@ function sleep(ms) {
 
 function nowMs() {
   return Date.now();
+}
+
+function isRateLimitErrorMessage(msg) {
+  return typeof msg === "string" && msg.includes("HTTP 429");
 }
 
 function getLocalState(device_id) {
@@ -84,6 +89,10 @@ async function fetchDeviceStatus(tag) {
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   try {
+    if (!SERVER_URI) throw new Error("Missing SHELLY_SERVER_URI");
+    if (!AUTH_KEY) throw new Error("Missing SHELLY_AUTH_KEY");
+    if (!tag) throw new Error("Missing shellyTag");
+
     const res = await fetch(`${SERVER_URI}/device/status`, {
       method: "POST",
       signal: controller.signal,
@@ -114,30 +123,31 @@ async function fetchDeviceStatus(tag) {
 }
 
 async function fetchDeviceStatusWithRetry(tag) {
-  let lastError;
+  let attempt = 0;
 
-  for (let attempt = 0; attempt <= MAX_RETRIES_429; attempt++) {
+  while (true) {
     try {
       return await fetchDeviceStatus(tag);
     } catch (e) {
-      lastError = e;
-      const msg = String(e?.message || e);
+      const msg = e?.message || String(e);
 
-      if (msg.includes("HTTP 429")) {
-        if (attempt < MAX_RETRIES_429) {
-          console.log(
-            `[${TAG_TO_DBID[tag] || tag}] 429 -> attente ${RETRY_429_MS} ms`
-          );
-          await sleep(RETRY_429_MS);
-          continue;
-        }
+      if (isRateLimitErrorMessage(msg) && attempt < MAX_RETRIES_429) {
+        const backoff =
+          BACKOFF_BASE_MS * Math.pow(2, attempt) +
+          Math.floor(Math.random() * 250);
+
+        console.log(
+          `[${TAG_TO_DBID[tag] || tag}] 429 -> attente ${backoff} ms (retry ${attempt + 1}/${MAX_RETRIES_429})`
+        );
+
+        await sleep(backoff);
+        attempt += 1;
+        continue;
       }
 
       throw e;
     }
   }
-
-  throw lastError;
 }
 
 async function pollOneDevice(shellyTag) {
@@ -241,6 +251,8 @@ async function main() {
   console.log("PORT =", PORT);
   console.log("INTERVAL_MS =", INTERVAL_MS);
   console.log("BETWEEN_DEVICES_MS =", BETWEEN_DEVICES_MS);
+  console.log("MAX_RETRIES_429 =", MAX_RETRIES_429);
+  console.log("BACKOFF_BASE_MS =", BACKOFF_BASE_MS);
 
   while (true) {
     try {
