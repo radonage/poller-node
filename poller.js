@@ -1,10 +1,12 @@
 import http from "http";
-import { createClient } from "@supabase/supabase-js";
 
-const SUPABASE_URL = "https://fkcnhgdzpqbbcudoyjhn.supabase.co";
-const SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZrY25oZ2R6cHFiYmN1ZG95amhuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjA1NzUwMCwiZXhwIjoyMDg3NjMzNTAwfQ.slS-vZkGoCpWoncM9r7etTfqJ5e5sTi2WkkQhoYRg3Q";
-const SERVER_URI = "https://shelly-165-eu.shelly.cloud";
-const AUTH_KEY = "MmVkMWVidWlk2CAB39DBD5697035A61BC935AA12DF1D78A1196C36B19FB1B6AA4B8FB72062AB450CE001DBB77341";
+const PORT = process.env.PORT || 8080;
+
+const SERVER_URI =
+  process.env.SHELLY_SERVER_URI || "https://shelly-165-eu.shelly.cloud";
+const AUTH_KEY =
+  process.env.SHELLY_AUTH_KEY ||
+  "REMPLACE_PAR_TA_NOUVELLE_CLE";
 
 const SHELLY_DEVICE_IDS = [
   "f1b457",
@@ -14,15 +16,6 @@ const SHELLY_DEVICE_IDS = [
   "7c87ceb4811e",
 ];
 
-const START_W = 5;
-const STOP_W = 3;
-
-const INTERVAL_MS = 3000; 
-const FETCH_TIMEOUT_MS = 15000;
-const PORT = 8080;
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
 const TAG_TO_DBID = {
   f1b457: "F1",
   f1b3d3: "F2",
@@ -31,33 +24,45 @@ const TAG_TO_DBID = {
   "7c87ceb4811e": "F5",
 };
 
+const START_W = 5;
+const STOP_W = 3;
+
+const INTERVAL_MS = 10000;
+const BETWEEN_DEVICES_MS = 1500;
+
+const ACTIVE_FROM = 8;
+const ACTIVE_TO = 24;
+
+const FETCH_TIMEOUT_MS = 15000;
+const MAX_RETRIES_429 = 2;
+const RETRY_429_MS = 4000;
+
+const stateMap = {};
+let lastResponse = null;
 let running = false;
-let pollCount = 0;
+let scanCount = 0;
+
+function inActiveWindow() {
+  const h = new Date().getHours();
+  return h >= ACTIVE_FROM && h < ACTIVE_TO;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 function nowMs() {
   return Date.now();
 }
 
-async function fetchDeviceStatus(tag) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-  try {
-    const res = await fetch(`${SERVER_URI}/device/status`, {
-      method: "POST",
-      signal: controller.signal,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        id: tag,
-        auth_key: AUTH_KEY,
-      }),
-    });
-
-    const data = await res.json();
-    return data;
-  } finally {
-    clearTimeout(timeout);
+function getLocalState(device_id) {
+  if (!stateMap[device_id]) {
+    stateMap[device_id] = {
+      active: false,
+      open_start_ms: null,
+    };
   }
+  return stateMap[device_id];
 }
 
 function extractPower(data) {
@@ -75,115 +80,199 @@ function extractPower(data) {
   return null;
 }
 
-async function getState(device_id) {
-  const { data } = await supabase
-    .from("device_state")
-    .select("*")
-    .eq("device_id", device_id)
-    .maybeSingle();
+async function fetchDeviceStatus(tag) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-  return (
-    data || {
-      device_id,
-      active: false,
-      open_start_ms: null,
+  try {
+    const res = await fetch(`${SERVER_URI}/device/status`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: tag,
+        auth_key: AUTH_KEY,
+      }),
+    });
+
+    const text = await res.text();
+
+    let data = {};
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`Réponse non JSON: ${text}`);
     }
-  );
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${text}`);
+    }
+
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-async function saveState(st) {
-  await supabase.from("device_state").upsert(
-    {
-      device_id: st.device_id,
-      active: st.active,
-      open_start_ms: st.open_start_ms,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: "device_id" }
-  );
+async function fetchDeviceStatusWithRetry(tag) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES_429; attempt++) {
+    try {
+      return await fetchDeviceStatus(tag);
+    } catch (e) {
+      lastError = e;
+      const msg = String(e?.message || e);
+
+      if (msg.includes("HTTP 429")) {
+        console.log(
+          `[${TAG_TO_DBID[tag] || tag}] 429 -> attente ${RETRY_429_MS} ms`
+        );
+        await sleep(RETRY_429_MS);
+        continue;
+      }
+
+      throw e;
+    }
+  }
+
+  throw lastError;
 }
 
-async function insertSessionStart(device_id, start_ms, start_w) {
-  await supabase.from("sessions").insert({
-    device_id,
-    start_ms,
-    start_w,
-  });
-}
-
-async function updateSessionStop(device_id, start_ms, end_ms, end_w) {
-  const duration_sec = Math.round((end_ms - start_ms) / 1000);
-
-  await supabase
-    .from("sessions")
-    .update({ end_ms, end_w, duration_sec })
-    .eq("device_id", device_id)
-    .eq("start_ms", start_ms)
-    .is("end_ms", null);
-}
-
-async function pollOne(tag) {
+async function pollOneDevice(shellyTag) {
   const ts = nowMs();
-  const device_id = TAG_TO_DBID[tag] || tag;
+  const device_id = TAG_TO_DBID[shellyTag] || shellyTag;
 
-  const status = await fetchDeviceStatus(tag);
+  const status = await fetchDeviceStatusWithRetry(shellyTag);
   const power = extractPower(status);
 
-  const st = await getState(device_id);
+  if (!Number.isFinite(power)) {
+    return {
+      ok: false,
+      ts,
+      shellyTag,
+      device_id,
+      error: "POWER_NOT_FOUND",
+    };
+  }
+
+  const st = getLocalState(device_id);
 
   if (!st.active && power > START_W) {
     st.active = true;
     st.open_start_ms = ts;
-
-    await insertSessionStart(device_id, ts, power);
   } else if (st.active && power < STOP_W) {
-    const start = st.open_start_ms;
-
     st.active = false;
     st.open_start_ms = null;
-
-    if (start) {
-      await updateSessionStop(device_id, start, ts, power);
-    }
   }
 
-  await saveState(st);
-
-  return { device_id, power, active: st.active };
+  return {
+    ok: true,
+    ts,
+    shellyTag,
+    device_id,
+    power,
+    active: st.active,
+  };
 }
 
 async function tick() {
-  if (running) return;
-
-  running = true;
-  pollCount++;
-
-  console.log("--------------------------------------------------");
-  console.log(`[POLL ${pollCount}] ${new Date().toISOString()}`);
-
-  try {
-    for (const tag of SHELLY_DEVICE_IDS) {
-      const r = await pollOne(tag);
-      console.log(r);
-    }
-  } catch (e) {
-    console.error("Erreur:", e.message);
+  if (running) {
+    console.log("⏳ Scan déjà en cours, tick ignoré");
+    return lastResponse;
   }
 
-  running = false;
+  running = true;
+  scanCount++;
+
+  console.log("--------------------------------------------------");
+  console.log(`⏱ Scan #${scanCount} :`, new Date().toLocaleString());
+
+  try {
+    if (!inActiveWindow()) {
+      console.log("⏸ Hors plage horaire...");
+
+      lastResponse = {
+        ok: true,
+        count: 0,
+        results: [],
+        skipped: true,
+        reason: "OUTSIDE_ACTIVE_WINDOW",
+      };
+
+      return lastResponse;
+    }
+
+    const results = [];
+
+    for (const tag of SHELLY_DEVICE_IDS) {
+      try {
+        const r = await pollOneDevice(tag);
+        results.push(r);
+      } catch (e) {
+        results.push({
+          ok: false,
+          ts: nowMs(),
+          shellyTag: tag,
+          device_id: TAG_TO_DBID[tag] || tag,
+          error: e?.message || String(e),
+        });
+      }
+
+      await sleep(BETWEEN_DEVICES_MS);
+    }
+
+    const response = {
+      ok: results.every((r) => r.ok),
+      count: results.length,
+      results,
+    };
+
+    lastResponse = response;
+
+    console.log("JSON parsé :", JSON.stringify(response, null, 2));
+    return response;
+  } finally {
+    running = false;
+  }
 }
 
 function main() {
-  console.log("Poller démarré");
-  console.log("Interval :", INTERVAL_MS, "ms");
+  console.log("Poller direct Shelly démarré...");
+  console.log("PORT =", PORT);
+  console.log("INTERVAL_MS =", INTERVAL_MS);
+  console.log("BETWEEN_DEVICES_MS =", BETWEEN_DEVICES_MS);
 
   tick();
   setInterval(tick, INTERVAL_MS);
 }
 
 http
-  .createServer((req, res) => {
-    res.writeHead(200);
+  .createServer(async (req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("OK");
+      return;
+    }
+
+    if (req.url === "/last") {
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(
+        JSON.stringify(
+          lastResponse || {
+            ok: true,
+            count: 0,
+            results: [],
+            message: "Aucun scan encore effectué",
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("Poller running");
   })
   .listen(PORT, "0.0.0.0", () => {
