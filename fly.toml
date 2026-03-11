@@ -1,19 +1,23 @@
-# fly.toml
+# fly.toml app configuration file generated for poller-node-olie-q on 2026-03-11T19:48:46Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "poller-node-plrz1g"
-primary_region = "cdg"
+app = 'poller-node-olie-q'
+primary_region = 'fra'
 
 [build]
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false
+  auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 1
-  processes = ["app"]
+  min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
-  memory = "256mb"
-  cpu_kind = "shared"
+  memory = '1gb'
+  cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 256
