@@ -5,8 +5,7 @@ const PORT = process.env.PORT || 8080;
 const SERVER_URI =
   process.env.SHELLY_SERVER_URI || "https://shelly-165-eu.shelly.cloud";
 const AUTH_KEY =
-  process.env.SHELLY_AUTH_KEY ||
-  "MmVkMWVidWlk2CAB39DBD5697035A61BC935AA12DF1D78A1196C36B19FB1B6AA4B8FB72062AB450CE001DBB77341";
+  process.env.SHELLY_AUTH_KEY || "MmVkMWVidWlk2CAB39DBD5697035A61BC935AA12DF1D78A1196C36B19FB1B6AA4B8FB72062AB450CE001DBB77341";
 
 const SHELLY_DEVICE_IDS = [
   "f1b457",
@@ -27,15 +26,15 @@ const TAG_TO_DBID = {
 const START_W = 5;
 const STOP_W = 3;
 
-const INTERVAL_MS = 10000;
-const BETWEEN_DEVICES_MS = 1500;
+const INTERVAL_MS = 15000;
+const BETWEEN_DEVICES_MS = 2000;
 
 const ACTIVE_FROM = 8;
 const ACTIVE_TO = 24;
 
 const FETCH_TIMEOUT_MS = 15000;
-const MAX_RETRIES_429 = 2;
-const RETRY_429_MS = 4000;
+const MAX_RETRIES_429 = 1;
+const RETRY_429_MS = 5000;
 
 const stateMap = {};
 let lastResponse = null;
@@ -125,11 +124,13 @@ async function fetchDeviceStatusWithRetry(tag) {
       const msg = String(e?.message || e);
 
       if (msg.includes("HTTP 429")) {
-        console.log(
-          `[${TAG_TO_DBID[tag] || tag}] 429 -> attente ${RETRY_429_MS} ms`
-        );
-        await sleep(RETRY_429_MS);
-        continue;
+        if (attempt < MAX_RETRIES_429) {
+          console.log(
+            `[${TAG_TO_DBID[tag] || tag}] 429 -> attente ${RETRY_429_MS} ms`
+          );
+          await sleep(RETRY_429_MS);
+          continue;
+        }
       }
 
       throw e;
@@ -178,7 +179,6 @@ async function pollOneDevice(shellyTag) {
 
 async function tick() {
   if (running) {
-    console.log("⏳ Scan déjà en cours, tick ignoré");
     return lastResponse;
   }
 
@@ -229,7 +229,6 @@ async function tick() {
     };
 
     lastResponse = response;
-
     console.log("JSON parsé :", JSON.stringify(response, null, 2));
     return response;
   } finally {
@@ -237,18 +236,25 @@ async function tick() {
   }
 }
 
-function main() {
+async function main() {
   console.log("Poller direct Shelly démarré...");
   console.log("PORT =", PORT);
   console.log("INTERVAL_MS =", INTERVAL_MS);
   console.log("BETWEEN_DEVICES_MS =", BETWEEN_DEVICES_MS);
 
-  tick();
-  setInterval(tick, INTERVAL_MS);
+  while (true) {
+    try {
+      await tick();
+    } catch (e) {
+      console.log("Erreur globale :", e?.message || String(e));
+    }
+
+    await sleep(INTERVAL_MS);
+  }
 }
 
 http
-  .createServer(async (req, res) => {
+  .createServer((req, res) => {
     if (req.url === "/health") {
       res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
       res.end("OK");
