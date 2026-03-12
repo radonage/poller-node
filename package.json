@@ -1,8 +1,11 @@
 {
-  "name": "poller",
+  "name": "poll",
   "version": "1.0.0",
   "type": "module",
   "scripts": {
     "start": "node poller.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.99.1"
   }
 }
