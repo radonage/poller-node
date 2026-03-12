@@ -1,18 +1,30 @@
 import http from "http";
+import { createClient } from "@supabase/supabase-js";
 
-const PORT = process.env.PORT || 8080;
+const PORT = Number(process.env.PORT || 8080);
 
-const SERVER_URI =
-  process.env.SHELLY_SERVER_URI || "https://shelly-165-eu.shelly.cloud";
-const AUTH_KEY = process.env.SHELLY_AUTH_KEY || "MmVkMWVidWlk2CAB39DBD5697035A61BC935AA12DF1D78A1196C36B19FB1B6AA4B8FB72062AB450CE001DBB77341";
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const SHELLY_DEVICE_IDS = [
-  "f1b457",
-  "f1b3d3",
-  "7c87cebaa2ca",
-  "7c87ceb512a6",
-  "7c87ceb4811e",
-];
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+const SERVER_URI = process.env.SHELLY_SERVER_URI;
+const AUTH_KEY = process.env.SHELLY_AUTH_KEY;
+
+const START_W = Number(process.env.START_THRESHOLD ?? 5);
+const STOP_W = Number(process.env.STOP_THRESHOLD ?? 3);
+
+const MAX_RETRIES_429 = Number(process.env.SHELLY_MAX_RETRIES_429 ?? 3);
+const BACKOFF_BASE_MS = Number(process.env.SHELLY_BACKOFF_BASE_MS ?? 800);
+
+const INTERVAL_MS = Number(process.env.INTERVAL_MS ?? 10000);
+const ACTIVE_FROM = Number(process.env.ACTIVE_FROM ?? 8);
+const ACTIVE_TO = Number(process.env.ACTIVE_TO ?? 24);
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS ?? 15000);
 
 const TAG_TO_DBID = {
   f1b457: "F1",
@@ -22,54 +34,35 @@ const TAG_TO_DBID = {
   "7c87ceb4811e": "F5",
 };
 
-const START_W = Number(process.env.START_THRESHOLD ?? 5);
-const STOP_W = Number(process.env.STOP_THRESHOLD ?? 3);
-
-const INTERVAL_MS = Number(process.env.INTERVAL_MS ?? 15000);
-const BETWEEN_DEVICES_MS = Number(process.env.BETWEEN_DEVICES_MS ?? 2000);
-
-const ACTIVE_FROM = Number(process.env.ACTIVE_FROM ?? 8);
-const ACTIVE_TO = Number(process.env.ACTIVE_TO ?? 24);
-
-const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS ?? 15000);
-
-// ✅ même logique que Vercel
-const MAX_RETRIES_429 = Number(process.env.SHELLY_MAX_RETRIES_429 ?? 3);
-const BACKOFF_BASE_MS = Number(process.env.SHELLY_BACKOFF_BASE_MS ?? 800);
-
-const stateMap = {};
 let lastResponse = null;
 let running = false;
 let scanCount = 0;
+
+function nowMs() {
+  return Date.now();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRateLimitErrorMessage(msg) {
+  return typeof msg === "string" && msg.includes("429");
+}
 
 function inActiveWindow() {
   const h = new Date().getHours();
   return h >= ACTIVE_FROM && h < ACTIVE_TO;
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function getShellyTagsFromEnv() {
+  return (process.env.SHELLY_DEVICE_IDS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
-function nowMs() {
-  return Date.now();
-}
-
-function isRateLimitErrorMessage(msg) {
-  return typeof msg === "string" && msg.includes("HTTP 429");
-}
-
-function getLocalState(device_id) {
-  if (!stateMap[device_id]) {
-    stateMap[device_id] = {
-      active: false,
-      open_start_ms: null,
-    };
-  }
-  return stateMap[device_id];
-}
-
-function extractPower(data) {
+function extractPowerW(data) {
   const ds = data?.data?.device_status ?? data?.device_status ?? data;
 
   const a = ds?.meters?.[0]?.power;
@@ -84,21 +77,21 @@ function extractPower(data) {
   return null;
 }
 
-async function fetchDeviceStatus(tag) {
+async function fetchDeviceStatus(shellyTag) {
+  if (!SERVER_URI) throw new Error("Missing SHELLY_SERVER_URI");
+  if (!AUTH_KEY) throw new Error("Missing SHELLY_AUTH_KEY");
+  if (!shellyTag) throw new Error("Missing shellyTag");
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   try {
-    if (!SERVER_URI) throw new Error("Missing SHELLY_SERVER_URI");
-    if (!AUTH_KEY) throw new Error("Missing SHELLY_AUTH_KEY");
-    if (!tag) throw new Error("Missing shellyTag");
-
     const res = await fetch(`${SERVER_URI}/device/status`, {
       method: "POST",
       signal: controller.signal,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        id: tag,
+        id: shellyTag,
         auth_key: AUTH_KEY,
       }),
     });
@@ -113,7 +106,7 @@ async function fetchDeviceStatus(tag) {
     }
 
     if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${text}`);
+      throw new Error(`device/status ${res.status}: ${JSON.stringify(data)}`);
     }
 
     return data;
@@ -122,12 +115,12 @@ async function fetchDeviceStatus(tag) {
   }
 }
 
-async function fetchDeviceStatusWithRetry(tag) {
+async function fetchDeviceStatusWithRetry(shellyTag) {
   let attempt = 0;
 
   while (true) {
     try {
-      return await fetchDeviceStatus(tag);
+      return await fetchDeviceStatus(shellyTag);
     } catch (e) {
       const msg = e?.message || String(e);
 
@@ -137,7 +130,7 @@ async function fetchDeviceStatusWithRetry(tag) {
           Math.floor(Math.random() * 250);
 
         console.log(
-          `[${TAG_TO_DBID[tag] || tag}] 429 -> attente ${backoff} ms (retry ${attempt + 1}/${MAX_RETRIES_429})`
+          `[${TAG_TO_DBID[shellyTag] || shellyTag}] 429 -> attente ${backoff} ms (retry ${attempt + 1}/${MAX_RETRIES_429})`
         );
 
         await sleep(backoff);
@@ -150,12 +143,78 @@ async function fetchDeviceStatusWithRetry(tag) {
   }
 }
 
+async function getState(device_id) {
+  const { data, error } = await supabase
+    .from("device_state")
+    .select("*")
+    .eq("device_id", device_id)
+    .maybeSingle();
+
+  if (error) throw new Error(error.message);
+
+  return (
+    data || {
+      device_id,
+      active: false,
+      pending_start_ms: null,
+      pending_stop_ms: null,
+      open_start_ms: null,
+    }
+  );
+}
+
+async function saveState(st) {
+  const { error } = await supabase.from("device_state").upsert(
+    {
+      device_id: st.device_id,
+      active: st.active,
+      pending_start_ms: st.pending_start_ms,
+      pending_stop_ms: st.pending_stop_ms,
+      open_start_ms: st.open_start_ms,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "device_id" }
+  );
+
+  if (error) throw new Error(error.message);
+}
+
+async function insertSessionStart(device_id, start_ms, start_w) {
+  const { error } = await supabase.from("sessions").insert({
+    device_id,
+    start_ms,
+    start_w,
+  });
+
+  if (error) throw new Error(error.message);
+}
+
+async function updateSessionStop(device_id, start_ms, end_ms, end_w) {
+  const duration_sec = Math.max(0, Math.round((end_ms - start_ms) / 1000));
+
+  const { data, error } = await supabase
+    .from("sessions")
+    .update({
+      end_ms,
+      end_w,
+      duration_sec,
+    })
+    .eq("device_id", device_id)
+    .eq("start_ms", start_ms)
+    .is("end_ms", null)
+    .select("device_id,start_ms,end_ms");
+
+  if (error) throw new Error(error.message);
+
+  return data?.length ?? 0;
+}
+
 async function pollOneDevice(shellyTag) {
   const ts = nowMs();
   const device_id = TAG_TO_DBID[shellyTag] || shellyTag;
 
   const status = await fetchDeviceStatusWithRetry(shellyTag);
-  const power = extractPower(status);
+  const power = extractPowerW(status);
 
   if (!Number.isFinite(power)) {
     return {
@@ -167,15 +226,29 @@ async function pollOneDevice(shellyTag) {
     };
   }
 
-  const st = getLocalState(device_id);
+  const st = await getState(device_id);
 
   if (!st.active && power > START_W) {
     st.active = true;
     st.open_start_ms = ts;
+    st.pending_start_ms = null;
+    st.pending_stop_ms = null;
+
+    await insertSessionStart(device_id, st.open_start_ms, power);
   } else if (st.active && power < STOP_W) {
+    const startMs = st.open_start_ms;
+
     st.active = false;
     st.open_start_ms = null;
+    st.pending_start_ms = null;
+    st.pending_stop_ms = null;
+
+    if (startMs) {
+      await updateSessionStop(device_id, startMs, ts, power);
+    }
   }
+
+  await saveState(st);
 
   return {
     ok: true,
@@ -189,33 +262,54 @@ async function pollOneDevice(shellyTag) {
 
 async function tick() {
   if (running) {
-    return lastResponse;
+    return (
+      lastResponse || {
+        ok: false,
+        count: 0,
+        results: [],
+        error: "SCAN_ALREADY_RUNNING",
+      }
+    );
   }
 
   running = true;
-  scanCount++;
+  scanCount += 1;
 
   console.log("--------------------------------------------------");
   console.log(`⏱ Scan #${scanCount} :`, new Date().toLocaleString());
 
   try {
-    if (!inActiveWindow()) {
-      console.log("⏸ Hors plage horaire...");
-
-      lastResponse = {
-        ok: true,
+    if (!SERVER_URI || !AUTH_KEY) {
+      const response = {
+        ok: false,
+        error: "Missing env vars (SHELLY_SERVER_URI / SHELLY_AUTH_KEY)",
         count: 0,
         results: [],
-        skipped: true,
-        reason: "OUTSIDE_ACTIVE_WINDOW",
       };
 
-      return lastResponse;
+      lastResponse = response;
+      console.log("JSON parsé :", JSON.stringify(response, null, 2));
+      return response;
+    }
+
+    const shellyTags = getShellyTagsFromEnv();
+
+    if (!shellyTags.length) {
+      const response = {
+        ok: false,
+        error: "Missing SHELLY_DEVICE_IDS",
+        count: 0,
+        results: [],
+      };
+
+      lastResponse = response;
+      console.log("JSON parsé :", JSON.stringify(response, null, 2));
+      return response;
     }
 
     const results = [];
 
-    for (const tag of SHELLY_DEVICE_IDS) {
+    for (const tag of shellyTags) {
       try {
         const r = await pollOneDevice(tag);
         results.push(r);
@@ -228,8 +322,6 @@ async function tick() {
           error: e?.message || String(e),
         });
       }
-
-      await sleep(BETWEEN_DEVICES_MS);
     }
 
     const response = {
@@ -240,6 +332,7 @@ async function tick() {
 
     lastResponse = response;
     console.log("JSON parsé :", JSON.stringify(response, null, 2));
+
     return response;
   } finally {
     running = false;
@@ -247,21 +340,29 @@ async function tick() {
 }
 
 async function main() {
-  console.log("Poller direct Shelly démarré...");
+  console.log("Poller démarré...");
   console.log("PORT =", PORT);
   console.log("INTERVAL_MS =", INTERVAL_MS);
-  console.log("BETWEEN_DEVICES_MS =", BETWEEN_DEVICES_MS);
+  console.log("ACTIVE_FROM =", ACTIVE_FROM);
+  console.log("ACTIVE_TO =", ACTIVE_TO);
   console.log("MAX_RETRIES_429 =", MAX_RETRIES_429);
   console.log("BACKOFF_BASE_MS =", BACKOFF_BASE_MS);
+  console.log("FETCH_TIMEOUT_MS =", FETCH_TIMEOUT_MS);
 
   while (true) {
     try {
-      await tick();
-    } catch (e) {
-      console.log("Erreur globale :", e?.message || String(e));
-    }
+      if (!inActiveWindow()) {
+        console.log("⏸ Hors plage horaire...");
+        await sleep(60000);
+        continue;
+      }
 
-    await sleep(INTERVAL_MS);
+      await tick();
+      await sleep(INTERVAL_MS);
+    } catch (e) {
+      console.log("Erreur -> retry dans 3s :", e?.message || String(e));
+      await sleep(3000);
+    }
   }
 }
 
@@ -274,7 +375,9 @@ http
     }
 
     if (req.url === "/last") {
-      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+      });
       res.end(
         JSON.stringify(
           lastResponse || {
