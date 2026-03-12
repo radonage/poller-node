@@ -3,8 +3,8 @@ import { createClient } from "@supabase/supabase-js";
 
 const PORT = Number(process.env.PORT || 8080);
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_URL = "https://fkcnhgdzpqbbcudoyjhn.supabase.co";
+const SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZrY25oZ2R6cHFiYmN1ZG95amhuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjA1NzUwMCwiZXhwIjoyMDg3NjMzNTAwfQ.slS-vZkGoCpWoncM9r7etTfqJ5e5sTi2WkkQhoYRg3Q";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -12,8 +12,8 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-const SERVER_URI = process.env.SHELLY_SERVER_URI;
-const AUTH_KEY = process.env.SHELLY_AUTH_KEY;
+const SERVER_URI = "https://shelly-165-eu.shelly.cloud";
+const AUTH_KEY = "MmVkMWVidWlk2CAB39DBD5697035A61BC935AA12DF1D78A1196C36B19FB1B6AA4B8FB72062AB450CE001DBB77341";
 
 const START_W = Number(process.env.START_THRESHOLD ?? 5);
 const STOP_W = Number(process.env.STOP_THRESHOLD ?? 3);
@@ -56,7 +56,7 @@ function inActiveWindow() {
 }
 
 function getShellyTagsFromEnv() {
-  return (process.env.SHELLY_DEVICE_IDS || "")
+  return ("f1b457,f1b3d3,7c87cebaa2ca,7c87ceb512a6,7c87ceb4811e" || "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
